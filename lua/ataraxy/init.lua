@@ -9,6 +9,10 @@ local M = {}
 
 local AUTO_IMPORT_SYSTEM_PROMPT = "You are a dependency resolver. Given a code snippet and its language, output ONLY the import statements required for any undefined symbols in the snippet. One statement per line. No explanations, no markdown fences, no blank lines. If no imports are needed, output nothing."
 
+local DOCSTRING_SYSTEM_PROMPT = "You are an elite code synthesis engine. Given a docstring and its surrounding file context, output ONLY the complete function implementation that fulfills the docstring contract. Do NOT repeat the docstring. Do NOT wrap in markdown backticks. Do NOT add commentary."
+
+local SUFFIX_CHECK_SYSTEM_PROMPT = 'You are a syntax checker. Given a line of code and a proposed replacement, determine if appending the trailing suffix to the replacement would produce a syntax error. Respond with ONLY "replace" (discard suffix) or "keep" (append suffix).'
+
 local state = {
   debounce_timer = nil,
   active_job_id = nil,
@@ -21,6 +25,12 @@ local state = {
   diff_scratch_bufnr = nil,
   diff_scratch_win = nil,
   diff_job_id = nil,
+
+  docstring_mode = false,
+  docstring_info = nil,
+
+  suffix_decision = nil,
+  suffix_check_job_id = nil,
 }
 
 local function cancel_active_completion()
@@ -28,11 +38,18 @@ local function cancel_active_completion()
     api.cancel(state.active_job_id)
     state.active_job_id = nil
   end
+  if state.suffix_check_job_id then
+    api.cancel(state.suffix_check_job_id)
+    state.suffix_check_job_id = nil
+  end
   if state.debounce_timer then
     state.debounce_timer:stop()
     state.debounce_timer:close()
     state.debounce_timer = nil
   end
+  state.suffix_decision = nil
+  state.docstring_mode = false
+  state.docstring_info = nil
   ui.ghost_clear()
 end
 
@@ -83,9 +100,30 @@ local function trigger_completion(bufnr, row, col)
   state.last_fim_row = row
   state.last_fim_col = col
 
-  local prefix = prompt_mod.build_fim(bufnr, row, col)
-  local messages = prompt_mod.build_fim_messages(bufnr, row, col)
-  local system_prompt = config.get("system_prompt")
+  local docstring_info = prompt_mod.detect_docstring(bufnr, row)
+
+  if docstring_info then
+    if docstring_info.empty then return end
+    state.docstring_mode = true
+    state.docstring_info = docstring_info
+  else
+    state.docstring_mode = false
+    state.docstring_info = nil
+  end
+
+  local filetype = vim.bo[bufnr].filetype
+  local prefix, suffix = prompt_mod.build_fim(bufnr, row, col)
+  local messages, system_prompt
+
+  if state.docstring_mode then
+    messages = prompt_mod.build_docstring_messages(filetype, prefix, docstring_info.text, suffix)
+    system_prompt = DOCSTRING_SYSTEM_PROMPT
+  else
+    messages = prompt_mod.build_fim_messages(bufnr, row, col)
+    system_prompt = config.get("system_prompt")
+  end
+
+  state.suffix_decision = nil
 
   local accumulated = ""
   state.active_job_id = api.stream(
@@ -97,9 +135,37 @@ local function trigger_completion(bufnr, row, col)
     end,
     function()
       state.active_job_id = nil
-      local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row)
-      if stripped ~= accumulated then
-        ui.ghost_set_text(stripped)
+
+      if not state.docstring_mode then
+        local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row)
+        if stripped ~= accumulated then
+          accumulated = stripped
+          ui.ghost_set_text(stripped)
+        end
+      end
+
+      -- Fire suffix-safety check if there are trailing chars after the cursor.
+      local current_line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
+      local trailing = current_line:sub(col + 1)
+      if trailing:match("%S") then
+        local check_response = ""
+        local check_msgs = prompt_mod.build_suffix_check_messages(filetype, accumulated, trailing)
+        state.suffix_check_job_id = api.stream(
+          check_msgs,
+          SUFFIX_CHECK_SYSTEM_PROMPT,
+          function(token) check_response = check_response .. token end,
+          function()
+            state.suffix_check_job_id = nil
+            local decision = (check_response:match("^%s*(.-)%s*$") or ""):lower()
+            state.suffix_decision = (decision == "replace") and "replace" or "keep"
+          end,
+          function(_err)
+            state.suffix_check_job_id = nil
+            state.suffix_decision = "keep"
+          end
+        )
+      else
+        state.suffix_decision = "keep"
       end
     end,
     function(err)
@@ -164,8 +230,60 @@ local function setup_buffer_autocmds(bufnr)
           vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "n", false
         )
       end
+
       local cursor = vim.api.nvim_win_get_cursor(0)
-      ui.ghost_commit(bufnr, cursor[1] - 1, cursor[2])
+
+      if state.docstring_mode and state.docstring_info then
+        local filetype = vim.bo[bufnr].filetype
+        local func_name = prompt_mod.extract_func_name_from_text(ghost, filetype)
+        local existing = func_name and prompt_mod.find_func_in_buffer(bufnr, func_name, filetype)
+
+        if existing then
+          if state.diff_active then
+            ui.notify("Agent session already active. Use :AtaraxyAccept or :AtaraxyCancel first.", vim.log.levels.WARN)
+            return
+          end
+
+          cancel_active_completion()
+
+          local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+          local ghost_lines = vim.split(ghost, "\n", { plain = true })
+
+          local new_lines = {}
+          for i = 1, existing.start_row do
+            table.insert(new_lines, all_lines[i])
+          end
+          for _, l in ipairs(ghost_lines) do
+            table.insert(new_lines, l)
+          end
+          for i = existing.end_row + 2, #all_lines do
+            table.insert(new_lines, all_lines[i])
+          end
+
+          local scratch_buf, scratch_win = ui.open_diff_view(bufnr)
+          vim.api.nvim_buf_set_lines(scratch_buf, 0, -1, false, new_lines)
+
+          state.diff_active = true
+          state.diff_source_bufnr = bufnr
+          state.diff_scratch_bufnr = scratch_buf
+          state.diff_scratch_win = scratch_win
+
+          ui.notify("Function already exists. Review diff and use :AtaraxyAccept or :AtaraxyCancel.")
+          return
+        end
+      end
+
+      -- Cancel any in-flight suffix check; default to "keep" if still pending.
+      if state.suffix_check_job_id then
+        api.cancel(state.suffix_check_job_id)
+        state.suffix_check_job_id = nil
+        if state.suffix_decision == nil then
+          state.suffix_decision = "keep"
+        end
+      end
+
+      local drop_suffix = (state.suffix_decision == "replace")
+      ui.ghost_commit(bufnr, cursor[1] - 1, cursor[2], drop_suffix)
       cancel_active_completion()
       resolve_imports(bufnr, ghost)
     end,

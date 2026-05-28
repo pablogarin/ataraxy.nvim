@@ -74,7 +74,9 @@ function M.ghost_set_text(text)
   render_ghost(text, bufnr, row, col)
 end
 
-function M.ghost_commit(bufnr, row, col)
+-- drop_suffix: when true, trailing characters after the original cursor col are
+-- discarded rather than appended after the ghost text.
+function M.ghost_commit(bufnr, row, col, drop_suffix)
   bufnr = bufnr or ghost_state.bufnr or vim.api.nvim_get_current_buf()
   local text = ghost_state.text
   if text == "" then return end
@@ -84,7 +86,7 @@ function M.ghost_commit(bufnr, row, col)
   local lines = vim.split(text, "\n", { plain = true })
   local current_line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
   local before = current_line:sub(1, col)
-  local after = current_line:sub(col + 1)
+  local after = drop_suffix and "" or current_line:sub(col + 1)
 
   local new_lines = {}
   new_lines[1] = before .. lines[1]

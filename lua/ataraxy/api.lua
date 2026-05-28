@@ -18,24 +18,6 @@ local function build_request_body(messages, system_prompt, stream)
   return vim.json.encode(body)
 end
 
-local function parse_sse_chunk(chunk, on_token)
-  for line in chunk:gmatch("[^\n]+") do
-    if line:match("^data: %[DONE%]") then
-      return true
-    end
-    local data = line:match("^data: (.+)$")
-    if data then
-      local ok, decoded = pcall(vim.json.decode, data)
-      if ok and decoded.choices and decoded.choices[1] then
-        local delta = decoded.choices[1].delta
-        if delta and delta.content then
-          on_token(delta.content)
-        end
-      end
-    end
-  end
-  return false
-end
 
 function M.stream(messages, system_prompt, on_token, on_done, on_error)
   local opts = config.options

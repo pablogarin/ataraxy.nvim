@@ -183,4 +183,271 @@ function M.build_import_messages(filetype, existing_imports, snippet)
   }
 end
 
+-- Internal: Python triple-quoted docstring block containing cursor_row.
+-- Scans backward collecting all standalone-delimiter rows; an odd count means
+-- cursor is inside the block, an even count where the nearest row equals
+-- cursor_row means cursor is on the closing delimiter.
+local function find_python_docstring(lines, cursor_row)
+  for _, delim in ipairs({ '"""', "'''" }) do
+    local delim_rows = {}
+    for r = cursor_row, math.max(0, cursor_row - 100), -1 do
+      local stripped = (lines[r + 1] or ""):match("^%s*(.*)") or ""
+      if stripped:sub(1, #delim) == delim then
+        local after = stripped:sub(#delim + 1)
+        if not after:find(delim, 1, true) then
+          table.insert(delim_rows, r)
+        end
+      end
+    end
+
+    local open_row = nil
+    if #delim_rows % 2 == 1 then
+      open_row = delim_rows[#delim_rows]
+    elseif #delim_rows >= 2 and delim_rows[1] == cursor_row then
+      if (#delim_rows - 1) % 2 == 1 then
+        open_row = delim_rows[#delim_rows]
+      end
+    end
+
+    if open_row then
+      local close_row = nil
+      for r = open_row + 1, math.min(#lines - 1, open_row + 300) do
+        if (lines[r + 1] or ""):find(delim, 1, true) then
+          close_row = r
+          break
+        end
+      end
+      if close_row and cursor_row >= open_row and cursor_row <= close_row then
+        local doc_lines = {}
+        for r = open_row, close_row do
+          table.insert(doc_lines, lines[r + 1] or "")
+        end
+        return { text = table.concat(doc_lines, "\n"), start_row = open_row, end_row = close_row }
+      end
+    end
+  end
+  return nil
+end
+
+-- Internal: JSDoc block (/** ... */) containing cursor_row.
+local function find_jsdoc_block(lines, cursor_row)
+  local open_row = nil
+  for r = cursor_row, math.max(0, cursor_row - 100), -1 do
+    local line = lines[r + 1] or ""
+    if line:match("/%*%*") then open_row = r; break end
+    if r < cursor_row and line:match("%*/") then break end
+  end
+  if not open_row then return nil end
+  local close_row = nil
+  for r = open_row, math.min(#lines - 1, open_row + 200) do
+    if (lines[r + 1] or ""):match("%*/") then close_row = r; break end
+  end
+  if not (close_row and cursor_row >= open_row and cursor_row <= close_row) then
+    return nil
+  end
+  local doc_lines = {}
+  for r = open_row, close_row do
+    table.insert(doc_lines, lines[r + 1] or "")
+  end
+  return { text = table.concat(doc_lines, "\n"), start_row = open_row, end_row = close_row }
+end
+
+-- Internal: contiguous line-comment block (Lua ---, or // for other langs).
+local function find_line_comment_block(lines, cursor_row, pattern)
+  if not (lines[cursor_row + 1] or ""):match(pattern) then return nil end
+  local start_row = cursor_row
+  for r = cursor_row - 1, math.max(0, cursor_row - 100), -1 do
+    if (lines[r + 1] or ""):match(pattern) then start_row = r else break end
+  end
+  local end_row = cursor_row
+  for r = cursor_row + 1, math.min(#lines - 1, cursor_row + 100) do
+    if (lines[r + 1] or ""):match(pattern) then end_row = r else break end
+  end
+  local doc_lines = {}
+  for r = start_row, end_row do
+    table.insert(doc_lines, lines[r + 1] or "")
+  end
+  return { text = table.concat(doc_lines, "\n"), start_row = start_row, end_row = end_row }
+end
+
+-- Internal: find the last row (0-indexed) of a function starting at start_row.
+local function find_func_end(lines, start_row, filetype)
+  local total = #lines
+  if filetype == "python" then
+    local base_indent = #((lines[start_row + 1] or ""):match("^(%s*)") or "")
+    local last_body = start_row
+    for r = start_row + 1, total - 1 do
+      local line = lines[r + 1] or ""
+      if line:match("%S") then
+        local indent = #(line:match("^(%s*)") or "")
+        if indent <= base_indent then return last_body end
+        last_body = r
+      end
+    end
+    return last_body
+  elseif filetype == "lua" then
+    local depth = 0
+    for r = start_row, total - 1 do
+      local line = lines[r + 1] or ""
+      for _ in line:gmatch("%f[%w]function%f[%W]") do depth = depth + 1 end
+      for _ in line:gmatch("%f[%w]end%f[%W]") do
+        depth = depth - 1
+        if depth <= 0 then return r end
+      end
+    end
+    return total - 1
+  else
+    local depth = 0
+    for r = start_row, total - 1 do
+      local line = lines[r + 1] or ""
+      for _ in line:gmatch("{") do depth = depth + 1 end
+      for _ in line:gmatch("}") do
+        depth = depth - 1
+        if depth == 0 then return r end
+      end
+    end
+    return total - 1
+  end
+end
+
+-- Returns {text, start_row, end_row, empty} if cursor is inside/on a docstring block, else nil.
+-- `empty` is true when the body has no meaningful content (caller should suppress completion).
+function M.detect_docstring(bufnr, row)
+  local filetype = vim.bo[bufnr].filetype
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  local result
+  if filetype == "python" then
+    result = find_python_docstring(lines, row)
+  elseif filetype == "javascript" or filetype == "typescript"
+      or filetype == "javascriptreact" or filetype == "typescriptreact" then
+    result = find_jsdoc_block(lines, row)
+  elseif filetype == "lua" then
+    result = find_line_comment_block(lines, row, "^%s*%-%-%-")
+  else
+    result = find_line_comment_block(lines, row, "^%s*//")
+  end
+
+  if not result then return nil end
+
+  -- Determine if the docstring body has meaningful content.
+  local has_content = false
+  for _, raw in ipairs(vim.split(result.text, "\n", { plain = true })) do
+    local line = raw:match("^%s*(.-)%s*$") or ""
+    local body
+    if filetype == "python" then
+      if line ~= '"""' and line ~= "'''" then body = line end
+    elseif filetype == "javascript" or filetype == "typescript"
+        or filetype == "javascriptreact" or filetype == "typescriptreact" then
+      if line ~= "/**" and line ~= "*/" then
+        body = line:match("^%*%s?(.+)") or (line ~= "*" and line or "")
+      end
+    elseif filetype == "lua" then
+      body = line:match("^%-%-%-(.+)")
+    else
+      body = line:match("^//(.+)")
+    end
+    if body and body:match("%S") then
+      has_content = true
+      break
+    end
+  end
+  result.empty = not has_content
+  return result
+end
+
+-- Extracts the function/method name from the first meaningful line of ghost text.
+function M.extract_func_name_from_text(text, filetype)
+  local first = (text:match("^%s*([^\n]+)") or ""):match("^%s*(.-)%s*$")
+  if filetype == "python" then
+    return first:match("def%s+([%w_]+)%s*%(")
+  elseif filetype == "javascript" or filetype == "typescript"
+      or filetype == "javascriptreact" or filetype == "typescriptreact" then
+    return first:match("^%s*async%s+function%s+([%w_]+)%s*%(")
+        or first:match("^%s*function%s+([%w_]+)%s*%(")
+        or first:match("^%s*([%w_]+)%s*[:=]%s*%(?%s*async%s+function")
+        or first:match("^%s*export%s+[%w_]+%s+function%s+([%w_]+)%s*%(")
+  elseif filetype == "lua" then
+    return first:match("local%s+function%s+([%w_]+)%s*%(")
+        or first:match("function%s+([%w_%.]+)%s*%(")
+        or first:match("^%s*([%w_]+)%s*=%s*function")
+  elseif filetype == "go" then
+    return first:match("func%s+%b()%s+([%w_]+)%s*%(")
+        or first:match("func%s+([%w_]+)%s*%(")
+  elseif filetype == "rust" then
+    return first:match("fn%s+([%w_]+)%s*%(")
+  else
+    return first:match("[%s%*]([%w_]+)%s*%(") or first:match("^([%w_]+)%s*%(")
+  end
+end
+
+-- Finds an existing function by name and returns {start_row, end_row} (0-indexed) or nil.
+function M.find_func_in_buffer(bufnr, func_name, filetype)
+  if not func_name or func_name == "" then return nil end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local esc = vim.pesc(func_name)
+
+  local patterns
+  if filetype == "python" then
+    patterns = { "def%s+" .. esc .. "%s*%(" }
+  elseif filetype == "javascript" or filetype == "typescript"
+      or filetype == "javascriptreact" or filetype == "typescriptreact" then
+    patterns = {
+      "function%s+" .. esc .. "%s*%(",
+      "async%s+function%s+" .. esc .. "%s*%(",
+      esc .. "%s*=%s*function",
+      esc .. "%s*[:=]%s*%(.*%)%s*[={]",
+    }
+  elseif filetype == "lua" then
+    patterns = {
+      "function%s+" .. esc .. "%s*%(",
+      "local%s+function%s+" .. esc .. "%s*%(",
+      esc .. "%s*=%s*function",
+    }
+  elseif filetype == "go" then
+    patterns = { "func%s+%b()%s+" .. esc .. "%s*%(", "func%s+" .. esc .. "%s*%(" }
+  elseif filetype == "rust" then
+    patterns = { "fn%s+" .. esc .. "%s*%(", "pub%s+fn%s+" .. esc .. "%s*%(" }
+  else
+    patterns = { "[%s%*]" .. esc .. "%s*%(", "^" .. esc .. "%s*%(" }
+  end
+
+  for i, line in ipairs(lines) do
+    for _, pat in ipairs(patterns) do
+      if line:match(pat) then
+        local start_row = i - 1
+        return { start_row = start_row, end_row = find_func_end(lines, start_row, filetype) }
+      end
+    end
+  end
+  return nil
+end
+
+-- Builds the messages for the secondary suffix-safety check.
+-- The model responds with "replace" or "keep".
+function M.build_suffix_check_messages(filetype, ghost_text, suffix)
+  return {
+    {
+      role = "user",
+      content = string.format(
+        "Language: %s\nReplacement: %s\nTrailing suffix: %s",
+        filetype, ghost_text, suffix
+      ),
+    },
+  }
+end
+
+-- Builds the messages for docstring-driven function generation.
+function M.build_docstring_messages(filetype, prefix, docstring_text, suffix)
+  return {
+    {
+      role = "user",
+      content = string.format(
+        "Language: %s\n\nFile context (prefix):\n%s\n\nDocstring:\n%s\n\nFile context (suffix):\n%s",
+        filetype, prefix, docstring_text, suffix
+      ),
+    },
+  }
+end
+
 return M
