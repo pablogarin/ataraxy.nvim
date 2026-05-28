@@ -4,6 +4,10 @@ A lightweight Neovim (v0.10+) inline code completion and conversational coding a
 
 As you type, ataraxy streams ghost-text completions directly into your buffer using Fill-in-the-Middle (FIM) prompting. When you need deeper assistance, `:AtaraxyPrompt` opens an interactive agent that applies changes in a live diff view — letting you review, edit, accept, or discard the generation before touching your source file.
 
+## Why Ataraxy?
+
+Ataraxy (also spelled ataraxia) is a philosophical and psychological term that describes a state of serene calmness, characterized by complete freedom from emotional disturbance, anxiety, or mental agitation
+
 ---
 
 ## Requirements
