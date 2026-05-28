@@ -175,7 +175,7 @@ require("ataraxy").setup({
 
 | Command             | Description |
 |---------------------|-------------|
-| `:AtaraxyPrompt`    | Open the interactive agent input. Sends the active file, your prompt, `.ataraxy.md` workspace context, and any skills to the LLM. The result streams into a scratch buffer shown in a vertical diff split. |
+| `:AtaraxyPrompt`    | Open the interactive agent input. Type your instruction, then press `<C-s>` or `<C-CR>` to submit, or `<Esc>` to cancel. Sends the active file, your prompt, `.ataraxy.md` workspace context, and any skills to the LLM. The result streams into a scratch buffer shown in a vertical diff split. |
 | `:AtaraxyAccept`    | Apply the diff — overwrites the source file with the scratch buffer contents and closes the diff view. Only available during an active agent session. |
 | `:AtaraxyCancel`    | Discard the generation — closes the diff view and scratch buffer without modifying the source file. Only available during an active agent session. |
 | `:AtaraxyRedo`      | Cancel the current inline completion and immediately retry it using the cached buffer context. |
@@ -228,11 +228,21 @@ print(skills.get_system_prompt("refactor"))
 3. Each token is rendered as ephemeral ghost text in a dedicated extmark namespace (`Comment` highlight group) — your buffer is not modified.
 4. Press `<Tab>` to commit the text at the cursor position. Any cursor movement or mode change cancels the suggestion and kills the network request.
 
+### Response echo stripping
+
+Chat-oriented LLMs sometimes echo back context that already exists in the buffer. ataraxy post-processes every completion before rendering: if the response begins with text that is already present at or near the cursor, that prefix is stripped so accepting a suggestion never duplicates existing lines.
+
+### Auto-import resolution
+
+When you accept a completion with `<Tab>`, ataraxy immediately fires a secondary background request to resolve any undefined symbols in the inserted snippet. If the model identifies missing imports, they are inserted at the conventional location for the active filetype (after the last existing import block, or at the top of the file if none exist). Imports that are already present in the file are never duplicated.
+
+Supported filetype conventions: Python, JavaScript/TypeScript (`import`/`require`), Go, Rust (`use`), Lua (`require`), C/C++ (`#include`). For other filetypes, new imports are prepended to line 1.
+
 ---
 
 ## Agent Diff Workflow
 
-1. Run `:AtaraxyPrompt` and enter your instruction.
+1. Run `:AtaraxyPrompt` and enter your instruction. Press `<C-s>` or `<C-CR>` to submit (`<Enter>` adds a newline — multi-line prompts are supported).
 2. ataraxy duplicates the active buffer into a scratch buffer (`buftype=nofile`) and opens it in a vertical split with `diffthis` applied to both sides.
 3. The LLM response streams token-by-token into the scratch buffer. You can freely edit it during or after streaming.
 4. Run `:AtaraxyAccept` to apply or `:AtaraxyCancel` to discard. The original file is never touched until you explicitly accept.
