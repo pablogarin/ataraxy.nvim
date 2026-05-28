@@ -73,11 +73,12 @@ function M.build_agent_messages(file_content, user_prompt, context_md, skills_te
   }
 end
 
--- Strip any prefix echo from a completion response.
--- LLMs sometimes repeat the partial line at the cursor or nearby buffer lines.
-function M.strip_echo(response, prefix, bufnr, row)
+-- Strip prefix and suffix echo from a completion response.
+-- LLMs frequently repeat text already present in <PREFIX> or <SUFFIX>.
+function M.strip_echo(response, prefix, bufnr, row, suffix)
   if response == "" then return response end
 
+  -- Strip prefix tail echo from the start.
   local tail = prefix:match("([^\n]*)$") or ""
   if tail ~= "" and response:sub(1, #tail) == tail then
     response = response:sub(#tail + 1)
@@ -86,6 +87,7 @@ function M.strip_echo(response, prefix, bufnr, row)
 
   if response == "" then return response end
 
+  -- Discard leading lines already present verbatim in the ±5-line buffer window.
   local win_start = math.max(0, row - 5)
   local win_end = math.min(vim.api.nvim_buf_line_count(bufnr), row + 6)
   local window_lines = vim.api.nvim_buf_get_lines(bufnr, win_start, win_end, false)
@@ -101,7 +103,25 @@ function M.strip_echo(response, prefix, bufnr, row)
   end
 
   if start_idx > #lines then return "" end
-  return table.concat(lines, "\n", start_idx)
+  response = table.concat(lines, "\n", start_idx)
+
+  -- Strip suffix_head echo from the end.
+  -- suffix_head is the text on the cursor line after the cursor column.
+  -- If the LLM echoed it at the tail of the response, remove it so that
+  -- ghost_commit does not double-insert it when it appends the buffer's
+  -- trailing content.
+  if suffix and suffix ~= "" then
+    local suffix_head = suffix:match("^([^\n]*)")
+    if suffix_head and suffix_head ~= "" then
+      local r = response:match("^(.-)\n*$") or response
+      if #suffix_head > 0 and r:sub(-#suffix_head) == suffix_head then
+        r = r:sub(1, -(#suffix_head + 1))
+        response = r:match("^(.-)\n*$") or r
+      end
+    end
+  end
+
+  return response
 end
 
 -- Returns a newline-joined string of all import lines found in the first 100

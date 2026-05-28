@@ -137,7 +137,7 @@ local function trigger_completion(bufnr, row, col)
       state.active_job_id = nil
 
       if not state.docstring_mode then
-        local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row)
+        local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row, suffix)
         if stripped ~= accumulated then
           accumulated = stripped
           ui.ghost_set_text(stripped)
