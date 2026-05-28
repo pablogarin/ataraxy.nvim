@@ -8,6 +8,8 @@ As you type, ataraxy streams ghost-text completions directly into your buffer us
 
 Ataraxy (also spelled ataraxia) is a philosophical and psychological term that describes a state of serene calmness, characterized by complete freedom from emotional disturbance, anxiety, or mental agitation
 
+This plugin embodies that state of serene calmness by removing the friction and anxiety from AI-assisted coding. Instead of overwhelming you with heavy configurations, intrusive popups, or unpredictable codebase edits, it operates silently in the background. By providing minimal inline completions and isolated diff views, it protects your developer focus and keeps your workflow completely peaceful.
+
 ---
 
 ## Requirements
