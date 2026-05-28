@@ -7,6 +7,8 @@ local skills = require("ataraxy.agent.skills")
 
 local M = {}
 
+local AUTO_IMPORT_SYSTEM_PROMPT = "You are a dependency resolver. Given a code snippet and its language, output ONLY the import statements required for any undefined symbols in the snippet. One statement per line. No explanations, no markdown fences, no blank lines. If no imports are needed, output nothing."
+
 local state = {
   debounce_timer = nil,
   active_job_id = nil,
@@ -34,6 +36,46 @@ local function cancel_active_completion()
   ui.ghost_clear()
 end
 
+local function resolve_imports(bufnr, committed_text)
+  local filetype = vim.bo[bufnr].filetype
+  if filetype == "" then return end
+
+  local existing = prompt_mod.extract_existing_imports(bufnr, filetype)
+  local messages = prompt_mod.build_import_messages(filetype, existing, committed_text)
+
+  local response = ""
+  api.stream(
+    messages,
+    AUTO_IMPORT_SYSTEM_PROMPT,
+    function(token) response = response .. token end,
+    function()
+      if response:match("^%s*$") then return end
+
+      local existing_set = {}
+      for line in existing:gmatch("[^\n]+") do
+        existing_set[line:match("^%s*(.-)%s*$")] = true
+      end
+
+      local new_imports = {}
+      for line in response:gmatch("[^\n]+") do
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed ~= "" and not existing_set[trimmed] then
+          table.insert(new_imports, trimmed)
+          existing_set[trimmed] = true
+        end
+      end
+
+      if #new_imports == 0 then return end
+
+      local insert_row = prompt_mod.find_import_insert_row(bufnr, filetype)
+      vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row, false, new_imports)
+    end,
+    function(err)
+      ui.notify("Auto-import error: " .. err, vim.log.levels.WARN)
+    end
+  )
+end
+
 local function trigger_completion(bufnr, row, col)
   cancel_active_completion()
 
@@ -41,6 +83,7 @@ local function trigger_completion(bufnr, row, col)
   state.last_fim_row = row
   state.last_fim_col = col
 
+  local prefix = prompt_mod.build_fim(bufnr, row, col)
   local messages = prompt_mod.build_fim_messages(bufnr, row, col)
   local system_prompt = config.get("system_prompt")
 
@@ -54,6 +97,10 @@ local function trigger_completion(bufnr, row, col)
     end,
     function()
       state.active_job_id = nil
+      local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row)
+      if stripped ~= accumulated then
+        ui.ghost_set_text(stripped)
+      end
     end,
     function(err)
       state.active_job_id = nil
@@ -120,6 +167,7 @@ local function setup_buffer_autocmds(bufnr)
       local cursor = vim.api.nvim_win_get_cursor(0)
       ui.ghost_commit(bufnr, cursor[1] - 1, cursor[2])
       cancel_active_completion()
+      resolve_imports(bufnr, ghost)
     end,
     function()
       cancel_active_completion()

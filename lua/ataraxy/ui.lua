@@ -10,12 +10,23 @@ local ghost_state = {
   mark_id = nil,
 }
 
-local function split_first_line(text)
-  local nl = text:find("\n")
-  if nl then
-    return text:sub(1, nl - 1), text:sub(nl + 1)
+local function render_ghost(text, bufnr, row, col)
+  vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
+  local lines = vim.split(text, "\n", { plain = true })
+  local virt_lines = {}
+  for i = 2, #lines do
+    table.insert(virt_lines, { { lines[i], "Comment" } })
   end
-  return text, nil
+  local mark_opts = {
+    virt_text = { { lines[1], "Comment" } },
+    virt_text_pos = "inline",
+    hl_mode = "combine",
+  }
+  if #virt_lines > 0 then
+    mark_opts.virt_lines = virt_lines
+    mark_opts.virt_lines_above = false
+  end
+  ghost_state.mark_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id, row, col, mark_opts)
 end
 
 function M.ghost_clear(bufnr)
@@ -37,29 +48,30 @@ function M.ghost_append(token, bufnr, row, col)
   ghost_state.row = row
   ghost_state.col = col
   ghost_state.text = ghost_state.text .. token
+  render_ghost(ghost_state.text, bufnr, row, col)
+end
 
+-- Replace the currently displayed ghost text in place. Used by echo stripping
+-- to swap the raw streamed response for the sanitised version without touching
+-- the buffer or resetting position state.
+function M.ghost_set_text(text)
+  local bufnr = ghost_state.bufnr
+  local row = ghost_state.row
+  local col = ghost_state.col
+  if not bufnr or row == nil then return end
+
+  ghost_state.text = text
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
 
-  local lines = vim.split(ghost_state.text, "\n", { plain = true })
-  local virt_lines = {}
-
-  local first_line_text = lines[1]
-  for i = 2, #lines do
-    table.insert(virt_lines, { { lines[i], "Comment" } })
+  if text == "" then
+    ghost_state.bufnr = nil
+    ghost_state.row = nil
+    ghost_state.col = nil
+    ghost_state.mark_id = nil
+    return
   end
 
-  local mark_opts = {
-    virt_text = { { first_line_text, "Comment" } },
-    virt_text_pos = "inline",
-    hl_mode = "combine",
-  }
-
-  if #virt_lines > 0 then
-    mark_opts.virt_lines = virt_lines
-    mark_opts.virt_lines_above = false
-  end
-
-  ghost_state.mark_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id, row, col, mark_opts)
+  render_ghost(text, bufnr, row, col)
 end
 
 function M.ghost_commit(bufnr, row, col)
@@ -103,10 +115,6 @@ function M.open_agent_input(on_submit, on_cancel)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = "markdown"
 
-  local border_lines = { "Enter prompt (Ctrl-Enter to submit, Esc to cancel):" }
-  local header_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(header_buf, 0, -1, false, border_lines)
-
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
     width = width,
@@ -115,20 +123,23 @@ function M.open_agent_input(on_submit, on_cancel)
     col = col_pos,
     style = "minimal",
     border = "rounded",
-    title = " AtaraxyPrompt ",
+    title = " AtaraxyPrompt  <C-s> / <C-CR> submit  <Esc> cancel ",
     title_pos = "center",
   })
 
   vim.wo[win].wrap = true
 
-  vim.keymap.set({ "n", "i" }, "<C-CR>", function()
+  local function do_submit()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     local prompt = table.concat(lines, "\n"):match("^%s*(.-)%s*$")
     vim.api.nvim_win_close(win, true)
     if prompt ~= "" and on_submit then
       on_submit(prompt)
     end
-  end, { buffer = buf, silent = true, noremap = true })
+  end
+
+  vim.keymap.set({ "n", "i" }, "<C-s>", do_submit, { buffer = buf, silent = true, noremap = true })
+  vim.keymap.set({ "n", "i" }, "<C-CR>", do_submit, { buffer = buf, silent = true, noremap = true })
 
   vim.keymap.set({ "n", "i" }, "<Esc>", function()
     vim.api.nvim_win_close(win, true)

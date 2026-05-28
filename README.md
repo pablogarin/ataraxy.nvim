@@ -252,8 +252,17 @@ Supported filetype conventions: Python, JavaScript/TypeScript (`import`/`require
 ## Development
 
 ```sh
-# Run the test suite (requires plenary.nvim on the runtimepath)
-nvim --headless -u tests/minimal_init.lua -c "PlenaryBustedDirectory tests/"
+# Run the test suite.
+# Plenary spawns isolated child processes — pass --noplugin and the minimal
+# init so each child uses the development tree rather than any installed copy.
+PLENARY=$(nvim --headless -c "lua io.write(vim.fn.stdpath('data')..'/site/pack/packer/start/plenary.nvim')" -c "qa!" 2>&1)
+INIT=$(pwd)/tests/minimal_init.lua
+for f in tests/test_*.lua; do
+  nvim --headless \
+    -c "set rtp+=.,$PLENARY | runtime plugin/plenary.vim" \
+    --noplugin -u "$INIT" \
+    -c "lua require('plenary.busted').run('$(pwd)/$f')"
+done
 
 # Lint
 luacheck lua/
