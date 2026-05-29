@@ -75,17 +75,30 @@ end
 
 -- Strip prefix and suffix echo from a completion response.
 -- LLMs frequently repeat text already present in <PREFIX> or <SUFFIX>.
+-- Returns (response, suffix_head_stripped) where suffix_head_stripped is true
+-- when the suffix_head was removed from the tail of the response.
 function M.strip_echo(response, prefix, bufnr, row, suffix)
-  if response == "" then return response end
+  if response == "" then return response, false end
 
   -- Strip prefix tail echo from the start.
   local tail = prefix:match("([^\n]*)$") or ""
-  if tail ~= "" and response:sub(1, #tail) == tail then
-    response = response:sub(#tail + 1)
-    response = response:match("^\n(.*)") or response
+  if tail ~= "" then
+    if response:sub(1, #tail) == tail then
+      response = response:sub(#tail + 1)
+      response = response:match("^\n(.*)") or response
+    else
+      -- The model may have omitted the line's leading indentation (it knows the
+      -- buffer already contains it).  Try matching tail without its leading
+      -- whitespace so we still strip the echoed non-whitespace portion.
+      local tail_unindented = tail:match("^%s+(.+)") or ""
+      if tail_unindented ~= "" and response:sub(1, #tail_unindented) == tail_unindented then
+        response = response:sub(#tail_unindented + 1)
+        response = response:match("^\n(.*)") or response
+      end
+    end
   end
 
-  if response == "" then return response end
+  if response == "" then return response, false end
 
   -- Discard leading lines already present verbatim in the ±5-line buffer window.
   local win_start = math.max(0, row - 5)
@@ -102,7 +115,7 @@ function M.strip_echo(response, prefix, bufnr, row, suffix)
     start_idx = start_idx + 1
   end
 
-  if start_idx > #lines then return "" end
+  if start_idx > #lines then return "", false end
   response = table.concat(lines, "\n", start_idx)
 
   -- Strip suffix_head echo from the end.
@@ -110,6 +123,7 @@ function M.strip_echo(response, prefix, bufnr, row, suffix)
   -- If the LLM echoed it at the tail of the response, remove it so that
   -- ghost_commit does not double-insert it when it appends the buffer's
   -- trailing content.
+  local suffix_stripped = false
   if suffix and suffix ~= "" then
     local suffix_head = suffix:match("^([^\n]*)")
     if suffix_head and suffix_head ~= "" then
@@ -117,11 +131,12 @@ function M.strip_echo(response, prefix, bufnr, row, suffix)
       if #suffix_head > 0 and r:sub(-#suffix_head) == suffix_head then
         r = r:sub(1, -(#suffix_head + 1))
         response = r:match("^(.-)\n*$") or r
+        suffix_stripped = true
       end
     end
   end
 
-  return response
+  return response, suffix_stripped
 end
 
 -- Returns a newline-joined string of all import lines found in the first 100

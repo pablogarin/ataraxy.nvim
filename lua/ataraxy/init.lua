@@ -11,10 +11,9 @@ local AUTO_IMPORT_SYSTEM_PROMPT = "You are a dependency resolver. Given a code s
 
 local DOCSTRING_SYSTEM_PROMPT = "You are an elite code synthesis engine. Given a docstring and its surrounding file context, output ONLY the complete function implementation that fulfills the docstring contract. Do NOT repeat the docstring. Do NOT wrap in markdown backticks. Do NOT add commentary."
 
-local SUFFIX_CHECK_SYSTEM_PROMPT = 'You are a syntax checker. Given a line of code and a proposed replacement, determine if appending the trailing suffix to the replacement would produce a syntax error. Respond with ONLY "replace" (discard suffix) or "keep" (append suffix).'
-
 local state = {
   debounce_timer = nil,
+  completion_gen = 0,
   active_job_id = nil,
   last_fim_bufnr = nil,
   last_fim_row = nil,
@@ -28,26 +27,21 @@ local state = {
 
   docstring_mode = false,
   docstring_info = nil,
-
-  suffix_decision = nil,
-  suffix_check_job_id = nil,
 }
 
 local function cancel_active_completion()
+  -- Bump the generation so any vim.schedule_wrap callbacks already queued from
+  -- a fired timer see a stale gen and abort instead of firing a completion.
+  state.completion_gen = state.completion_gen + 1
   if state.active_job_id then
     api.cancel(state.active_job_id)
     state.active_job_id = nil
-  end
-  if state.suffix_check_job_id then
-    api.cancel(state.suffix_check_job_id)
-    state.suffix_check_job_id = nil
   end
   if state.debounce_timer then
     state.debounce_timer:stop()
     state.debounce_timer:close()
     state.debounce_timer = nil
   end
-  state.suffix_decision = nil
   state.docstring_mode = false
   state.docstring_info = nil
   ui.ghost_clear()
@@ -85,7 +79,13 @@ local function resolve_imports(bufnr, committed_text)
       if #new_imports == 0 then return end
 
       local insert_row = prompt_mod.find_import_insert_row(bufnr, filetype)
+      -- Suppress TextChangedI so import insertion does not re-trigger the
+      -- debounce timer and schedule a phantom completion ~300 ms later.
+      local saved_ei = vim.o.eventignore
+      vim.o.eventignore = saved_ei ~= "" and (saved_ei .. ",TextChangedI,TextChanged")
+          or "TextChangedI,TextChanged"
       vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row, false, new_imports)
+      vim.o.eventignore = saved_ei
     end,
     function(err)
       ui.notify("Auto-import error: " .. err, vim.log.levels.WARN)
@@ -123,8 +123,6 @@ local function trigger_completion(bufnr, row, col)
     system_prompt = config.get("system_prompt")
   end
 
-  state.suffix_decision = nil
-
   local accumulated = ""
   state.active_job_id = api.stream(
     messages,
@@ -139,33 +137,8 @@ local function trigger_completion(bufnr, row, col)
       if not state.docstring_mode then
         local stripped = prompt_mod.strip_echo(accumulated, prefix, bufnr, row, suffix)
         if stripped ~= accumulated then
-          accumulated = stripped
           ui.ghost_set_text(stripped)
         end
-      end
-
-      -- Fire suffix-safety check if there are trailing chars after the cursor.
-      local current_line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
-      local trailing = current_line:sub(col + 1)
-      if trailing:match("%S") then
-        local check_response = ""
-        local check_msgs = prompt_mod.build_suffix_check_messages(filetype, accumulated, trailing)
-        state.suffix_check_job_id = api.stream(
-          check_msgs,
-          SUFFIX_CHECK_SYSTEM_PROMPT,
-          function(token) check_response = check_response .. token end,
-          function()
-            state.suffix_check_job_id = nil
-            local decision = (check_response:match("^%s*(.-)%s*$") or ""):lower()
-            state.suffix_decision = (decision == "replace") and "replace" or "keep"
-          end,
-          function(_err)
-            state.suffix_check_job_id = nil
-            state.suffix_decision = "keep"
-          end
-        )
-      else
-        state.suffix_decision = "keep"
       end
     end,
     function(err)
@@ -183,9 +156,19 @@ local function debounced_completion(bufnr, row, col)
     state.debounce_timer = nil
   end
 
+  state.completion_gen = state.completion_gen + 1
+  local gen = state.completion_gen
+
   local debounce_ms = config.get("debounce_ms") or 300
   state.debounce_timer = vim.uv.new_timer()
   state.debounce_timer:start(debounce_ms, 0, vim.schedule_wrap(function()
+    -- If a newer debounce or a cancellation has incremented the generation
+    -- since this timer was created, this callback is stale — discard it.
+    -- This guards against vim.schedule_wrap callbacks that were already queued
+    -- when the timer fired but arrive after a subsequent cancel_active_completion
+    -- or debounced_completion call; without the check, both the stale and the
+    -- fresh callback would call trigger_completion, causing double completions.
+    if gen ~= state.completion_gen then return end
     if state.debounce_timer then
       state.debounce_timer:close()
       state.debounce_timer = nil
@@ -273,17 +256,10 @@ local function setup_buffer_autocmds(bufnr)
         end
       end
 
-      -- Cancel any in-flight suffix check; default to "keep" if still pending.
-      if state.suffix_check_job_id then
-        api.cancel(state.suffix_check_job_id)
-        state.suffix_check_job_id = nil
-        if state.suffix_decision == nil then
-          state.suffix_decision = "keep"
-        end
-      end
-
-      local drop_suffix = (state.suffix_decision == "replace")
-      ui.ghost_commit(bufnr, cursor[1] - 1, cursor[2], drop_suffix)
+      -- Trailing chars after the cursor are always preserved (complete-in-place
+      -- semantics): strip_echo already removed any suffix_head the model echoed,
+      -- so ghost text contains only what belongs between cursor and the next char.
+      ui.ghost_commit(bufnr, cursor[1] - 1, cursor[2])
       cancel_active_completion()
       resolve_imports(bufnr, ghost)
     end,
