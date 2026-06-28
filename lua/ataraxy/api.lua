@@ -1,125 +1,85 @@
-local config = require("ataraxy.config")
-
 local M = {}
 
-local active_jobs = {}
+local _active_job = nil
 
-local function build_request_body(messages, system_prompt, stream)
-  local opts = config.options
-  local body = {
-    model = opts.model or config.defaults.model,
-    temperature = opts.temperature or config.defaults.temperature,
-    stream = stream ~= false,
-    messages = messages,
-  }
-  if system_prompt then
-    table.insert(body.messages, 1, { role = "system", content = system_prompt })
-  end
-  return vim.json.encode(body)
-end
-
-
-function M.stream(messages, system_prompt, on_token, on_done, on_error)
-  local opts = config.options
-  local api_key = opts.api_key or config.defaults.api_key
-  local endpoint = (opts.api_endpoint or config.defaults.api_endpoint) .. "/v1/chat/completions"
-
-  if api_key == "" then
-    if on_error then on_error("No API key configured.") end
+-- Exported for unit testing.
+function M.parse_sse_line(line)
+  if not line:match("^data: ") then
     return nil
   end
+  local data = line:sub(7)
+  if data == "[DONE]" then
+    return nil
+  end
+  local ok, decoded = pcall(vim.fn.json_decode, data)
+  if not ok or type(decoded) ~= "table" then
+    return nil
+  end
+  local choices = decoded.choices
+  if type(choices) ~= "table" or not choices[1] then
+    return nil
+  end
+  local delta = choices[1].delta
+  if type(delta) ~= "table" then
+    return nil
+  end
+  return delta.content
+end
 
-  local body = build_request_body(messages, system_prompt, true)
-  local body_file = os.tmpname()
-  local f = io.open(body_file, "w")
-  f:write(body)
-  f:close()
+function M.request(cfg, payload, on_token, on_done)
+  M.cancel()
 
-  local cmd = {
-    "curl", "--silent", "--no-buffer", "--fail-with-body",
-    "-X", "POST", endpoint,
-    "-H", "Content-Type: application/json",
-    "-H", "Authorization: Bearer " .. api_key,
-    "--data-binary", "@" .. body_file,
-  }
+  local body = vim.fn.json_encode(payload)
+  local buf = ""
 
-  local buffer = ""
-  local job_id = tostring({}):match("0x(.+)")
-  local job = vim.system(cmd, {
-    stdout = function(err, chunk)
-      if err then
-        if on_error then
-          vim.schedule(function() on_error(tostring(err)) end)
+  _active_job = vim.system(
+    {
+      "curl", "--silent", "--no-buffer",
+      "-X", "POST",
+      "-H", "Content-Type: application/json",
+      "-H", "Authorization: Bearer " .. cfg.api_key,
+      "-d", body,
+      cfg.base_url .. "/chat/completions",
+    },
+    {
+      text = false,
+      stdout = function(err, chunk)
+        if err or not chunk then return end
+        buf = buf .. chunk
+        -- Collect complete lines in the fast callback; defer vim.fn calls.
+        local pending = {}
+        while true do
+          local nl = buf:find("\n")
+          if not nl then break end
+          pending[#pending + 1] = buf:sub(1, nl - 1):gsub("\r$", "")
+          buf = buf:sub(nl + 1)
         end
-        return
-      end
-      if chunk then
-        buffer = buffer .. chunk
-        local lines = {}
-        for line in (buffer .. "\n"):gmatch("([^\n]*)\n") do
-          table.insert(lines, line)
-        end
-        buffer = lines[#lines] or ""
-        table.remove(lines, #lines)
-        local done = false
-        for _, line in ipairs(lines) do
-          if line:match("^data: %[DONE%]") then
-            done = true
-            break
-          end
-          local data = line:match("^data: (.+)$")
-          if data then
-            local ok, decoded = pcall(vim.json.decode, data)
-            if ok and decoded.choices and decoded.choices[1] then
-              local delta = decoded.choices[1].delta
-              if delta and delta.content then
-                local token = delta.content
-                vim.schedule(function() on_token(token) end)
-              end
-            end
-          end
-        end
-        if done then
+        if #pending > 0 then
           vim.schedule(function()
-            os.remove(body_file)
-            active_jobs[job_id] = nil
-            if on_done then on_done() end
+            for _, line in ipairs(pending) do
+              local token = M.parse_sse_line(line)
+              if token then on_token(token) end
+            end
           end)
         end
-      end
-    end,
-  }, function(result)
-    os.remove(body_file)
-    active_jobs[job_id] = nil
-    if result.code ~= 0 then
-      if on_error then
-        vim.schedule(function()
-          on_error("curl exited with code " .. result.code .. ": " .. (result.stderr or ""))
-        end)
-      end
-    else
-      vim.schedule(function()
-        if on_done then on_done() end
-      end)
+      end,
+    },
+    function(out)
+      _active_job = nil
+      vim.schedule(function() on_done(out.code == 0) end)
     end
-  end)
-
-  active_jobs[job_id] = job
-  return job_id
+  )
 end
 
-function M.cancel(job_id)
-  if job_id and active_jobs[job_id] then
-    active_jobs[job_id]:kill(9)
-    active_jobs[job_id] = nil
+function M.cancel()
+  if _active_job then
+    _active_job:kill(9)
+    _active_job = nil
   end
 end
 
-function M.cancel_all()
-  for id, job in pairs(active_jobs) do
-    job:kill(9)
-    active_jobs[id] = nil
-  end
+function M.is_active()
+  return _active_job ~= nil
 end
 
 return M
